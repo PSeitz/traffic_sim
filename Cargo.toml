@@ -6,3 +6,4 @@ authors = ["Pascal Seitz <pascal.seitz@gmail.com>"]
 [dependencies]
 ggez = "0.4"
 rand = "0.4"
+petgraph = "0.4.11"

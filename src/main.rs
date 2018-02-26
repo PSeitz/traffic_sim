@@ -1,15 +1,31 @@
+extern crate ggez;
+extern crate petgraph;
+extern crate rand;
+use ggez::audio;
+use ggez::conf;
+use ggez::event::*;
+use ggez::{Context, ContextBuilder, GameResult};
+use ggez::graphics;
+use ggez::timer;
+use ggez::graphics::{Vector2, Point2};
+use ggez::nalgebra as na;
 
+use std::env;
+use std::path;
+
+pub mod road;
 
 #[derive(Debug, Default)]
 struct World {
     pos_x: f32,
-    grid: Vec<Vec<WorldCell>>
+    roads: road::RoadGraph
+    // grid: Vec<Vec<WorldCell>>
 }
 
-#[derive(Debug, Default)]
-struct WorldCell {
-    color: String
-}
+// #[derive(Debug, Default)]
+// struct WorldCell {
+//     color: String
+// }
 
 
 // extern crate ggez;
@@ -19,18 +35,327 @@ struct WorldCell {
 
 impl World {
     fn new(_ctx: &mut Context) -> GameResult<World> {
-        let num_rows = 5000;
-        let num_columns = 5000;
+        // let num_rows = 5000;
+        // let num_columns = 5000;
 
         let mut world = World::default();
 
-        for _ in 0..num_rows {
-            let mut row = (0..num_columns).map(|_| WorldCell::default()).collect();
-            world.grid.push(row);
-        }
+        // for _ in 0..num_rows {
+        //     let mut row = (0..num_columns).map(|_| WorldCell::default()).collect();
+        //     world.grid.push(row);
+        // }
         Ok(world)
     }
 }
+
+
+
+/// **********************************************************************
+/// Now we're getting into the actual game loop.  The `MainState` is our
+/// game's "global" state, it keeps track of everything we need for
+/// actually running the game.
+///
+/// Our game objects are simply a vector for each actor type, and we
+/// probably mingle gameplay-state (like score) and hardware-state
+/// (like `gui_dirty`) a little more than we should, but for something
+/// this small it hardly matters.
+/// **********************************************************************
+
+struct MainState {
+    player: Actor,
+    shots: Vec<Actor>,
+    cars: Vec<Actor>,
+    level: i32,
+    score: i32,
+    assets: Assets,
+    screen_width: u32,
+    screen_height: u32,
+    input: InputState,
+    player_shot_timeout: f32,
+    gui_dirty: bool,
+    score_display: graphics::Text,
+    level_display: graphics::Text,
+}
+
+
+impl MainState {
+    fn new(ctx: &mut Context) -> GameResult<MainState> {
+        ctx.print_resource_stats();
+        graphics::set_background_color(ctx, (0, 0, 0, 255).into());
+
+        println!("Game resource path: {:?}", ctx.filesystem);
+
+        print_instructions();
+
+        let assets = Assets::new(ctx)?;
+        let score_disp = graphics::Text::new(ctx, "score", &assets.font)?;
+        let level_disp = graphics::Text::new(ctx, "level", &assets.font)?;
+
+        let player = create_player();
+        let cars = create_cars(5, player.pos, 100.0, 250.0);
+
+        let s = MainState {
+            player: player,
+            shots: Vec::new(),
+            cars: cars,
+            level: 0,
+            score: 0,
+            assets: assets,
+            screen_width: ctx.conf.window_mode.width,
+            screen_height: ctx.conf.window_mode.height,
+            input: InputState::default(),
+            player_shot_timeout: 0.0,
+            gui_dirty: true,
+            score_display: score_disp,
+            level_display: level_disp,
+        };
+
+        Ok(s)
+    }
+
+    fn fire_player_shot(&mut self) {
+        self.player_shot_timeout = PLAYER_SHOT_TIME;
+
+        let player = &self.player;
+        let mut shot = create_shot();
+        shot.pos = player.pos;
+        shot.facing = player.facing;
+        let direction = vec_from_angle(shot.facing);
+        shot.velocity.x = SHOT_SPEED * direction.x;
+        shot.velocity.y = SHOT_SPEED * direction.y;
+
+        self.shots.push(shot);
+        let _ = self.assets.shot_sound.play();
+    }
+
+
+
+    fn clear_dead_stuff(&mut self) {
+        self.shots.retain(|s| s.life > 0.0);
+        self.cars.retain(|r| r.life > 0.0);
+    }
+
+    fn handle_collisions(&mut self) {
+        for rock in &mut self.cars {
+            let pdistance = rock.pos - self.player.pos;
+            if pdistance.norm() < (self.player.bbox_size + rock.bbox_size) {
+                self.player.life = 0.0;
+            }
+            for shot in &mut self.shots {
+                let distance = shot.pos - rock.pos;
+                if distance.norm() < (shot.bbox_size + rock.bbox_size) {
+                    shot.life = 0.0;
+                    rock.life = 0.0;
+                    self.score += 1;
+                    self.gui_dirty = true;
+                    let _ = self.assets.hit_sound.play();
+                }
+            }
+        }
+    }
+
+    fn check_for_level_respawn(&mut self) {
+        if self.cars.is_empty() {
+            self.level += 1;
+            self.gui_dirty = true;
+            let r = create_cars(self.level + 5, self.player.pos, 100.0, 250.0);
+            self.cars.extend(r);
+        }
+    }
+
+    fn update_ui(&mut self, ctx: &mut Context) {
+        let score_str = format!("Score: {}", self.score);
+        let level_str = format!("Level: {}", self.level);
+        let score_text = graphics::Text::new(ctx, &score_str, &self.assets.font).unwrap();
+        let level_text = graphics::Text::new(ctx, &level_str, &self.assets.font).unwrap();
+
+        self.score_display = score_text;
+        self.level_display = level_text;
+    }
+}
+
+
+/// **********************************************************************
+/// A couple of utility functions.
+/// **********************************************************************
+
+fn print_instructions() {
+    println!("Welcome to SUPER NICE!");
+}
+
+
+fn draw_actor(assets: &mut Assets,
+              ctx: &mut Context,
+              actor: &Actor,
+              world_coords: (u32, u32))
+              -> GameResult<()> {
+    let (screen_w, screen_h) = world_coords;
+    let pos = world_to_screen_coords(screen_w, screen_h, actor.pos);
+    let image = assets.actor_image(actor);
+    let drawparams = graphics::DrawParam {
+        dest: pos,
+        rotation: actor.facing as f32,
+        offset: graphics::Point2::new(0.5, 0.5),
+        .. Default::default()
+    };
+    graphics::draw_ex(ctx, image, drawparams)
+
+}
+
+/// **********************************************************************
+/// Now we implement the `EventHandler` trait from `ggez::event`, which provides
+/// ggez with callbacks for updating and drawing our game, as well as
+/// handling input events.
+/// **********************************************************************
+impl EventHandler for MainState {
+    fn update(&mut self, ctx: &mut Context) -> GameResult<()> {
+        const DESIRED_FPS: u32 = 60;
+
+        while timer::check_update_time(ctx, DESIRED_FPS) {
+            let seconds = 1.0 / (DESIRED_FPS as f32);
+
+            // Update the player state based on the user input.
+            player_handle_input(&mut self.player, &self.input, seconds);
+            self.player_shot_timeout -= seconds;
+            if self.input.fire && self.player_shot_timeout < 0.0 {
+                self.fire_player_shot();
+            }
+
+            // Update the physics for all actors.
+            // First the player...
+            update_actor_position(&mut self.player, seconds);
+            wrap_actor_position(&mut self.player,
+                                self.screen_width as f32,
+                                self.screen_height as f32);
+
+            // Then the shots...
+            for act in &mut self.shots {
+                update_actor_position(act, seconds);
+                wrap_actor_position(act, self.screen_width as f32, self.screen_height as f32);
+                handle_timed_life(act, seconds);
+            }
+
+            // And finally the cars.
+            for act in &mut self.cars {
+                update_actor_position(act, seconds);
+                wrap_actor_position(act, self.screen_width as f32, self.screen_height as f32);
+            }
+
+            // Handle the results of things moving:
+            // collision detection, object death, and if
+            // we have killed all the cars in the level,
+            // spawn more of them.
+            self.handle_collisions();
+
+            self.clear_dead_stuff();
+
+            self.check_for_level_respawn();
+
+            // Using a gui_dirty flag here is a little
+            // messy but fine here.
+            if self.gui_dirty {
+                self.update_ui(ctx);
+                self.gui_dirty = false;
+            }
+
+            // Finally we check for our end state.
+            // I want to have a nice death screen eventually,
+            // but for now we just quit.
+            if self.player.life <= 0.0 {
+                println!("Game over!");
+                let _ = ctx.quit();
+            }
+        }
+
+        Ok(())
+    }
+
+    fn draw(&mut self, ctx: &mut Context) -> GameResult<()> {
+        // Our drawing is quite simple.
+        // Just clear the screen...
+        graphics::clear(ctx);
+
+        // Loop over all objects drawing them...
+        {
+            let assets = &mut self.assets;
+            let coords = (self.screen_width, self.screen_height);
+
+            let p = &self.player;
+            draw_actor(assets, ctx, p, coords)?;
+
+            for s in &self.shots {
+                draw_actor(assets, ctx, s, coords)?;
+            }
+
+            for r in &self.cars {
+                draw_actor(assets, ctx, r, coords)?;
+            }
+        }
+
+
+        // And draw the GUI elements in the right places.
+        let level_dest = graphics::Point2::new(10.0,
+                                               10.0);
+        let score_dest = graphics::Point2::new(200.0,
+                                               10.0);
+        graphics::draw(ctx, &self.level_display, level_dest, 0.0)?;
+        graphics::draw(ctx, &self.score_display, score_dest, 0.0)?;
+
+        // Then we flip the screen...
+        graphics::present(ctx);
+
+        // And yield the timeslice
+        // This tells the OS that we're done using the CPU but it should
+        // get back to this program as soon as it can.
+        // This ideally prevents the game from using 100% CPU all the time
+        // even if vsync is off.
+        // The actual behavior can be a little platform-specific.
+        timer::yield_now();
+        Ok(())
+    }
+
+    // Handle key events.  These just map keyboard events
+    // and alter our input state appropriately.
+    fn key_down_event(&mut self,
+                      ctx: &mut Context,
+                      keycode: Keycode,
+                      _keymod: Mod,
+                      _repeat: bool) {
+        match keycode {
+            Keycode::Up => {
+                self.input.yaxis = 1.0;
+            }
+            Keycode::Left => {
+                self.input.xaxis = -1.0;
+            }
+            Keycode::Right => {
+                self.input.xaxis = 1.0;
+            }
+            Keycode::Space => {
+                self.input.fire = true;
+            }
+            Keycode::Escape => ctx.quit().unwrap(),
+            _ => (), // Do nothing
+        }
+    }
+
+
+    fn key_up_event(&mut self, _ctx: &mut Context, keycode: Keycode, _keymod: Mod, _repeat: bool) {
+        match keycode {
+            Keycode::Up => {
+                self.input.yaxis = 0.0;
+            }
+            Keycode::Left | Keycode::Right => {
+                self.input.xaxis = 0.0;
+            }
+            Keycode::Space => {
+                self.input.fire = false;
+            }
+            _ => (), // Do nothing
+        }
+    }
+}
+
 
 // impl event::EventHandler for World {
 //     fn update(&mut self, _ctx: &mut Context) -> GameResult<()> {
@@ -69,19 +394,7 @@ impl World {
 //     event::run(ctx, state).unwrap();
 // }
 
-extern crate ggez;
-extern crate rand;
-use ggez::audio;
-use ggez::conf;
-use ggez::event::*;
-use ggez::{Context, ContextBuilder, GameResult};
-use ggez::graphics;
-use ggez::timer;
-use ggez::graphics::{Vector2, Point2};
-use ggez::nalgebra as na;
 
-use std::env;
-use std::path;
 
 /// *********************************************************************
 /// Basic stuff, make some helpers for vector functions.
@@ -309,7 +622,7 @@ impl Assets {
     fn new(ctx: &mut Context) -> GameResult<Assets> {
         let player_image = graphics::Image::new(ctx, "/player.png")?;
         let shot_image = graphics::Image::new(ctx, "/shot.png")?;
-        let car_image = graphics::Image::new(ctx, "/car1_spr.png")?;
+        let car_image = graphics::Image::new(ctx, "/racing-pack/PNG/Cars/car_blue_small_5.png")?;
         // let font_path = path::Path::new("/consolefont.png");
         // let font_chars =
         //"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!,.?;'\"";
@@ -359,316 +672,7 @@ impl Default for InputState {
     }
 }
 
-/// **********************************************************************
-/// Now we're getting into the actual game loop.  The `MainState` is our
-/// game's "global" state, it keeps track of everything we need for
-/// actually running the game.
-///
-/// Our game objects are simply a vector for each actor type, and we
-/// probably mingle gameplay-state (like score) and hardware-state
-/// (like `gui_dirty`) a little more than we should, but for something
-/// this small it hardly matters.
-/// **********************************************************************
 
-struct MainState {
-    player: Actor,
-    shots: Vec<Actor>,
-    cars: Vec<Actor>,
-    level: i32,
-    score: i32,
-    assets: Assets,
-    screen_width: u32,
-    screen_height: u32,
-    input: InputState,
-    player_shot_timeout: f32,
-    gui_dirty: bool,
-    score_display: graphics::Text,
-    level_display: graphics::Text,
-}
-
-
-impl MainState {
-    fn new(ctx: &mut Context) -> GameResult<MainState> {
-        ctx.print_resource_stats();
-        graphics::set_background_color(ctx, (0, 0, 0, 255).into());
-
-        println!("Game resource path: {:?}", ctx.filesystem);
-
-        print_instructions();
-
-        let assets = Assets::new(ctx)?;
-        let score_disp = graphics::Text::new(ctx, "score", &assets.font)?;
-        let level_disp = graphics::Text::new(ctx, "level", &assets.font)?;
-
-        let player = create_player();
-        let cars = create_cars(5, player.pos, 100.0, 250.0);
-
-        let s = MainState {
-            player: player,
-            shots: Vec::new(),
-            cars: cars,
-            level: 0,
-            score: 0,
-            assets: assets,
-            screen_width: ctx.conf.window_mode.width,
-            screen_height: ctx.conf.window_mode.height,
-            input: InputState::default(),
-            player_shot_timeout: 0.0,
-            gui_dirty: true,
-            score_display: score_disp,
-            level_display: level_disp,
-        };
-
-        Ok(s)
-    }
-
-    fn fire_player_shot(&mut self) {
-        self.player_shot_timeout = PLAYER_SHOT_TIME;
-
-        let player = &self.player;
-        let mut shot = create_shot();
-        shot.pos = player.pos;
-        shot.facing = player.facing;
-        let direction = vec_from_angle(shot.facing);
-        shot.velocity.x = SHOT_SPEED * direction.x;
-        shot.velocity.y = SHOT_SPEED * direction.y;
-
-        self.shots.push(shot);
-        let _ = self.assets.shot_sound.play();
-    }
-
-
-
-    fn clear_dead_stuff(&mut self) {
-        self.shots.retain(|s| s.life > 0.0);
-        self.cars.retain(|r| r.life > 0.0);
-    }
-
-    fn handle_collisions(&mut self) {
-        for rock in &mut self.cars {
-            let pdistance = rock.pos - self.player.pos;
-            if pdistance.norm() < (self.player.bbox_size + rock.bbox_size) {
-                self.player.life = 0.0;
-            }
-            for shot in &mut self.shots {
-                let distance = shot.pos - rock.pos;
-                if distance.norm() < (shot.bbox_size + rock.bbox_size) {
-                    shot.life = 0.0;
-                    rock.life = 0.0;
-                    self.score += 1;
-                    self.gui_dirty = true;
-                    let _ = self.assets.hit_sound.play();
-                }
-            }
-        }
-    }
-
-    fn check_for_level_respawn(&mut self) {
-        if self.cars.is_empty() {
-            self.level += 1;
-            self.gui_dirty = true;
-            let r = create_cars(self.level + 5, self.player.pos, 100.0, 250.0);
-            self.cars.extend(r);
-        }
-    }
-
-    fn update_ui(&mut self, ctx: &mut Context) {
-        let score_str = format!("Score: {}", self.score);
-        let level_str = format!("Level: {}", self.level);
-        let score_text = graphics::Text::new(ctx, &score_str, &self.assets.font).unwrap();
-        let level_text = graphics::Text::new(ctx, &level_str, &self.assets.font).unwrap();
-
-        self.score_display = score_text;
-        self.level_display = level_text;
-    }
-}
-
-
-/// **********************************************************************
-/// A couple of utility functions.
-/// **********************************************************************
-
-fn print_instructions() {
-    println!();
-    println!("Welcome to ASTROBLASTO!");
-    println!();
-    println!("How to play:");
-    println!("L/R arrow keys rotate your ship, up thrusts, space bar fires");
-    println!();
-}
-
-
-fn draw_actor(assets: &mut Assets,
-              ctx: &mut Context,
-              actor: &Actor,
-              world_coords: (u32, u32))
-              -> GameResult<()> {
-    let (screen_w, screen_h) = world_coords;
-    let pos = world_to_screen_coords(screen_w, screen_h, actor.pos);
-    let image = assets.actor_image(actor);
-    let drawparams = graphics::DrawParam {
-        dest: pos,
-        rotation: actor.facing as f32,
-        offset: graphics::Point2::new(0.5, 0.5),
-        .. Default::default()
-    };
-    graphics::draw_ex(ctx, image, drawparams)
-
-}
-
-/// **********************************************************************
-/// Now we implement the `EventHandler` trait from `ggez::event`, which provides
-/// ggez with callbacks for updating and drawing our game, as well as
-/// handling input events.
-/// **********************************************************************
-impl EventHandler for MainState {
-    fn update(&mut self, ctx: &mut Context) -> GameResult<()> {
-        const DESIRED_FPS: u32 = 60;
-
-        while timer::check_update_time(ctx, DESIRED_FPS) {
-            let seconds = 1.0 / (DESIRED_FPS as f32);
-
-            // Update the player state based on the user input.
-            player_handle_input(&mut self.player, &self.input, seconds);
-            self.player_shot_timeout -= seconds;
-            if self.input.fire && self.player_shot_timeout < 0.0 {
-                self.fire_player_shot();
-            }
-
-            // Update the physics for all actors.
-            // First the player...
-            update_actor_position(&mut self.player, seconds);
-            wrap_actor_position(&mut self.player,
-                                self.screen_width as f32,
-                                self.screen_height as f32);
-
-            // Then the shots...
-            for act in &mut self.shots {
-                update_actor_position(act, seconds);
-                wrap_actor_position(act, self.screen_width as f32, self.screen_height as f32);
-                handle_timed_life(act, seconds);
-            }
-
-            // And finally the cars.
-            for act in &mut self.cars {
-                update_actor_position(act, seconds);
-                wrap_actor_position(act, self.screen_width as f32, self.screen_height as f32);
-            }
-
-            // Handle the results of things moving:
-            // collision detection, object death, and if
-            // we have killed all the cars in the level,
-            // spawn more of them.
-            self.handle_collisions();
-
-            self.clear_dead_stuff();
-
-            self.check_for_level_respawn();
-
-            // Using a gui_dirty flag here is a little
-            // messy but fine here.
-            if self.gui_dirty {
-                self.update_ui(ctx);
-                self.gui_dirty = false;
-            }
-
-            // Finally we check for our end state.
-            // I want to have a nice death screen eventually,
-            // but for now we just quit.
-            if self.player.life <= 0.0 {
-                println!("Game over!");
-                let _ = ctx.quit();
-            }
-        }
-
-        Ok(())
-    }
-
-    fn draw(&mut self, ctx: &mut Context) -> GameResult<()> {
-        // Our drawing is quite simple.
-        // Just clear the screen...
-        graphics::clear(ctx);
-
-        // Loop over all objects drawing them...
-        {
-            let assets = &mut self.assets;
-            let coords = (self.screen_width, self.screen_height);
-
-            let p = &self.player;
-            draw_actor(assets, ctx, p, coords)?;
-
-            for s in &self.shots {
-                draw_actor(assets, ctx, s, coords)?;
-            }
-
-            for r in &self.cars {
-                draw_actor(assets, ctx, r, coords)?;
-            }
-        }
-
-
-        // And draw the GUI elements in the right places.
-        let level_dest = graphics::Point2::new(10.0,
-                                               10.0);
-        let score_dest = graphics::Point2::new(200.0,
-                                               10.0);
-        graphics::draw(ctx, &self.level_display, level_dest, 0.0)?;
-        graphics::draw(ctx, &self.score_display, score_dest, 0.0)?;
-
-        // Then we flip the screen...
-        graphics::present(ctx);
-
-        // And yield the timeslice
-        // This tells the OS that we're done using the CPU but it should
-        // get back to this program as soon as it can.
-        // This ideally prevents the game from using 100% CPU all the time
-        // even if vsync is off.
-        // The actual behavior can be a little platform-specific.
-        timer::yield_now();
-        Ok(())
-    }
-
-    // Handle key events.  These just map keyboard events
-    // and alter our input state appropriately.
-    fn key_down_event(&mut self,
-                      ctx: &mut Context,
-                      keycode: Keycode,
-                      _keymod: Mod,
-                      _repeat: bool) {
-        match keycode {
-            Keycode::Up => {
-                self.input.yaxis = 1.0;
-            }
-            Keycode::Left => {
-                self.input.xaxis = -1.0;
-            }
-            Keycode::Right => {
-                self.input.xaxis = 1.0;
-            }
-            Keycode::Space => {
-                self.input.fire = true;
-            }
-            Keycode::Escape => ctx.quit().unwrap(),
-            _ => (), // Do nothing
-        }
-    }
-
-
-    fn key_up_event(&mut self, _ctx: &mut Context, keycode: Keycode, _keymod: Mod, _repeat: bool) {
-        match keycode {
-            Keycode::Up => {
-                self.input.yaxis = 0.0;
-            }
-            Keycode::Left | Keycode::Right => {
-                self.input.xaxis = 0.0;
-            }
-            Keycode::Space => {
-                self.input.fire = false;
-            }
-            _ => (), // Do nothing
-        }
-    }
-}
 
 /// **********************************************************************
 /// Finally our main function!  Which merely sets up a config and calls
@@ -681,7 +685,7 @@ pub fn main() {
                       .title("Astroblasto!")
         )
         .window_mode(conf::WindowMode::default()
-                     .dimensions(640, 480)
+                     .dimensions(1280, 960)
         );
 
 
